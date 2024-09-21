@@ -1,0 +1,192 @@
+% Canlogger.m
+% Script to import CAN data, filter desired fields, plot data and 
+% compute calculations for racing strategy team.
+clear; close all; clc
+
+%file = "Stint3.mat";
+%load(file)
+
+file = uigetfile;
+data = load(file);
+
+plotEnable = true;     % <--------------------------- Set to true to plot
+
+fileLaptime = erase( file , ".mat" );
+fileLaptime = strcat(fileLaptime, "Laptime.mat");
+
+try
+    dataLaps = cell2mat(struct2cell(load(fileLaptime)))';
+catch
+    warning('Issue with stint data, loading not complete!');
+end
+
+% Derired CAN messages
+logFields = [
+            "DG25_ivt_mppt_wh", 
+            "DG33_ivt_mc_wh",
+            "DG0_vehicle_speed"
+            ];
+% DG25_ivt_mppt_wh
+% DG33_ivt_mc_wh
+% DG0_vehicle_speed
+
+fields = fieldnames(data);
+values = struct2cell(data);
+
+% Filter out undesired struct fields
+nList = [];
+for i = 1:length(fieldnames(data))
+    if ~ismember(fields{i}, logFields)
+        data = rmfield(data, fields{i});
+    else
+        nList = [nList, length(data.(fields{i}))];
+    end
+end
+fields = fieldnames(data);
+
+% Do ZOH padding with highest data index to align data
+n = max(nList);
+paddedData = arrayPadding(data, n);
+logFieldsLegend = flip(strrep(logFields(:),"_"," "),1);
+
+
+% Battery percentage calculations
+batteryMax = 4500;      % <---------   Persumed Wh of fully charged battery
+batteryUsage = paddedData.DG33_ivt_mc_wh;
+batteryMax = ones(1, length(batteryUsage)).*batteryMax;
+batteryUsage = ((minus(batteryMax, batteryUsage))/45);
+if plotEnable == true
+    subplot(2,2,1);
+    title("VEICHLE SPEED")
+    hold on; grid on; axis tight
+    x = linspace(1,length(paddedData.(fields{1})),length(paddedData.(fields{1})));
+    dataTmp = double(paddedData.(fields{1}));
+    plot(x, dataTmp', "LineWidth", 2)
+    
+    plot(x, batteryUsage, "LineWidth", 2)
+    ylim([0 100])
+    legend(logFieldsLegend(1), "Battery percentage [%]")
+end
+
+%% Plots of absolute values and derivatives  
+% "DG25_ivt_mppt_wh", 
+% "DG33_ivt_mc_wh",
+
+absData = absoluteData(paddedData);
+logFieldsDerivative = ["DG25_ivt_mppt_wh", "DG33_ivt_mc_wh"];
+logFieldsLegendDerivative = flip(strrep(logFieldsDerivative(:),"_"," "), 1);
+
+% Subplots 2 and 3
+filterWindow = 2500;
+if plotEnable == true
+    for i = 1:length(logFieldsDerivative)
+        inData = absData.(logFieldsDerivative(i));
+        [filterData, filterDataDelta] = lowPassData(inData, filterWindow);
+        x = linspace(1,length(filterData), length(filterData));
+        
+        % Absolute changes to the acumnulated data
+        subplot(2,2,2);
+        plot(x, filterData, "LineWidth",2)
+        hold on, grid on, axis tight
+        legend(logFieldsLegendDerivative(1),logFieldsLegendDerivative(2))
+        title("ABSOLUTE ACUMULATED DATA")
+        xlabel("Sample")
+        ylabel("Magnitude")
+
+        % Derivative of the acumulated data
+        subplot(2,2,3);
+        plot(x, filterDataDelta, "LineWidth",2)
+        hold on, grid on, axis tight
+        legend(strcat(logFieldsLegendDerivative(1), " delta"), strcat(logFieldsLegendDerivative(2), " delta"))
+        title("DERIVATIVE DATA")
+        xlabel("Sample")
+        ylabel("Magnitude")
+    end
+end
+
+
+%% MATEMATHICAL CALCULATIONS
+
+% Computing number of laps and mean energy comsumtion
+ts = 0.02;
+interval = (mean(dataLaps)*60)/ts;
+numLaps = floor(n/interval);
+lapInterval = n /numLaps;
+
+[filterData, filterDataDelta] = lowPassData(absData.DG33_ivt_mc_wh, filterWindow);
+
+lapData = zeros(numLaps, floor(lapInterval));
+meanUsage = ones(numLaps,1);
+for i = 1:(numLaps)
+    lapData(i,:) = filterData((lapInterval*(i-1)+1): ((i)*lapInterval));
+    minusVector = ones(1,length(lapData(i,:))).*lapData(i,1);
+    lapData(i,:) = minus(lapData(i,:),minusVector);
+    meanUsage(i) = lapData(i,end);
+    clc
+end
+
+% Subplot 4
+if plotEnable == true
+    subplot(2,2,4);
+    plot(linspace(1,numLaps,numLaps), meanUsage, "-- o", "LineWidth",2)
+    hold on, grid on, axis tight
+
+    bar(linspace(2, length(dataLaps)+1, length(dataLaps)), dataLaps)
+    legend("Mean energy usage [Wh]", "Laptime [minute.second]")
+    title("ENERGY CONSUMTION PER LAP")
+    xlabel("Lap number")
+    ylabel("Energy Consumtion [Wh]/ Laptime ")
+end
+
+
+
+
+%%
+
+function absData = absoluteData(data)
+    % Function to linearly shift the relative CAN data to 
+    % absolute data for each driver, i.e. the acumulated 
+    % data starts from 0 for each file.
+    
+    absData = {};
+    currentField = fieldnames(data);
+    currentValues = struct2cell(data);
+    tempData = zeros(length(currentField), length(currentValues{1}));
+    
+    for i = 1:length(currentField)
+        initialValue = currentValues{i}(1);
+        minusVector = ones(1,length(data.(currentField{i}))).*initialValue;
+        tempData(i,:) = minus(data.(currentField{i}), minusVector);
+        absData = setfield(absData,currentField{i},tempData(i,:));
+    end
+end
+
+
+function [filterData, filterDataDelta] = lowPassData(data, filterWindow)
+    % Helper function to filter out iregulataties due to 
+    % zero-padding vectors for alignment. 
+    filterData = movmean(data, filterWindow);
+    filterDataDelta = diff(filterData);
+    filterDataDelta = movmean([filterDataDelta, filterDataDelta(end)], filterWindow);
+end
+
+
+function paddedData = arrayPadding(data, n)
+    % Helper functions to zero-pad (Zero-Order-Hold) to match 
+    % data with diferent sample times to eachother.
+    paddedData = {};
+    tempData = zeros(length(data), n);
+    currentField = fieldnames(data);
+
+    for i = 1:length(currentField)
+        xOld = linspace(1, length(data.(currentField{i})), length(data.(currentField{i}))); 
+        xNew = linspace(1, length(data.(currentField{i})), n);
+        currentData = double(data.(currentField{i}));
+        if ~(length(xOld) == length(xNew))
+            tempData(i,:) = interp1(xOld, currentData, xNew); 
+        else
+            tempData(i,:) = currentData;
+        end
+        paddedData = setfield(paddedData,currentField{i},tempData(i,:));
+    end
+end
